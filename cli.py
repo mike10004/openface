@@ -33,7 +33,7 @@ import openface
 import logging
 import csv
 import cachetools
-
+import itertools
 
 _log = logging.getLogger(__name__)
 
@@ -211,8 +211,8 @@ def _collect_pathnames(mode, positionals, index_file):
                 for line in ifile:
                     yield os.path.normpath(line.rstrip())
     elif mode == _MODE_MATCH:
-        for i in range(0, len(positionals), 2):
-            yield os.path.normpath(positionals[i]), os.path.normpath(positionals[i+1])
+        for a, b in itertools.combinations(positionals, 2):
+            yield os.path.normpath(a), os.path.normpath(b)
         if index_file:
             with open(index_file, 'r') as ifile:
                 for line in ifile:
