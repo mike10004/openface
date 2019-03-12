@@ -75,6 +75,7 @@ def _create_arg_parser():
     parser.add_argument('--imgDim', type=int, metavar='N', help="Default image dimension.", default=96)
     parser.add_argument('--verbose', action='store_true', help="be verbose")
     parser.add_argument('--cache-size', type=int, metavar="N", default=20000, help="set max number of items in cache")
+    parser.add_argument('--output-dir', help="set output directory")
     return parser
 
 
@@ -240,7 +241,8 @@ def main():
             rep = extractor.extract(image_file)
             if rep:
                 output_pathname = os.path.join(args.output_dir, os.path.basename(image_file) + '.ofr')
-                os.makedirs(os.path.dirname(output_pathname), exist_ok=True)
+                output_dir = args.output_dir if args.output_dir else os.getcwd()
+                os.makedirs(output_dir, exist_ok=True)
                 serialist.serialize_to_disk(rep, output_pathname)
                 extract_ok = 1
             else:
