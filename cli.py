@@ -79,6 +79,14 @@ def _create_arg_parser():
     return parser
 
 
+def _mkdirp(dirname):
+    try:
+        os.makedirs(dirname)
+    except Exception:
+        if not os.path.isdir(dirname):
+            raise
+
+
 class Serialist(object):
 
     disable_create_dirs = False
@@ -92,11 +100,7 @@ class Serialist(object):
     def serialize_to_disk(self, thing, pathname):
         dirname = os.path.dirname(pathname)
         if not self.disable_create_dirs and not os.path.exists(dirname):
-            try:
-                os.makedirs(dirname)
-            except IOError:
-                if not os.path.isdir(dirname):
-                    raise
+            _mkdirp(dirname)
         with open(pathname, 'wb') as ofile:
             self.serialize(thing, ofile)
 
@@ -246,11 +250,7 @@ def main():
             if rep is not None:
                 output_pathname = os.path.join(args.output_dir, os.path.basename(image_file) + '.ofr')
                 output_dir = args.output_dir if args.output_dir else os.getcwd()
-                try:
-                    os.makedirs(output_dir)
-                except IOError:
-                    if not os.path.isdir(output_dir):
-                        raise
+                _mkdirp(output_dir)
                 serialist.serialize_to_disk(rep, output_pathname)
                 extract_ok = 1
             else:
