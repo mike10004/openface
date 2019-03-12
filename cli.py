@@ -17,8 +17,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+#
+#
 # Modifications (c) Mike Chaberski distributed under same license
+#
 
 import argparse
 import cv2
@@ -41,21 +43,37 @@ class OpenfaceException(Exception):
     pass
 
 
-# noinspection PyTypeChecker
-def _create_arg_parser(fileDir):
-    modelDir = os.path.join(fileDir, 'models')
-    dlibModelDir = os.path.join(modelDir, 'dlib')
-    openfaceModelDir = os.path.join(modelDir, 'openface')
-    parser = argparse.ArgumentParser()
+_MODEL_FILENAME_OPENFACE = "nn4.small2.v1.t7"
+_MODEL_FILENAME_DLIB = "shape_predictor_68_face_landmarks.dat"
 
-    parser.add_argument('imgs', type=str, nargs='+', help="Input images.")
-    parser.add_argument('--dlibFacePredictor', type=str, help="Path to dlib's face predictor.",
-                        default=os.path.join(dlibModelDir, "shape_predictor_68_face_landmarks.dat"))
-    parser.add_argument('--networkModel', type=str, help="Path to Torch network model.",
-                        default=os.path.join(openfaceModelDir, 'nn4.small2.v1.t7'))
-    parser.add_argument('--imgDim', type=int,
-                        help="Default image dimension.", default=96)
-    parser.add_argument('--verbose', action='store_true')
+
+def _find_model(category, filename, cwd=os.getcwd()):
+    dirnames = [
+        os.path.join(cwd, category),
+        os.path.join(os.path.dirname(__file__), 'models', category),
+        os.path.join(os.getenv('HOME'), '.local', 'share', 'openface', 'models', category),
+    ]
+    candidates = map(lambda dirname: os.path.join(dirname, filename), dirnames)
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise OpenfaceException("could not find " + filename + "; searched these directories: " + str(dirnames))
+
+
+_MODE_EXTRACT = 'extract'
+_MODE_MATCH = 'match'
+
+
+# noinspection PyTypeChecker
+def _create_arg_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=(_MODE_EXTRACT, _MODE_MATCH), default=_MODE_MATCH, metavar='MODE', help="operating mode ('extract' or 'match')")
+    parser.add_argument('files', type=str, nargs='*', help="input files (images for 'extract' mode, templates for 'match' mode)")
+    parser.add_argument('--files-from', metavar='FILE', help="read input files from FILE; one per line for 'extract' mode, two per line for 'match'")
+    parser.add_argument('--dlibFacePredictor', type=str, metavar='FILE', help="Path to dlib's face predictor.")
+    parser.add_argument('--networkModel', type=str, metavar='FILE', help="Path to Torch network model.")
+    parser.add_argument('--imgDim', type=int, metavar='N', help="Default image dimension.", default=96)
+    parser.add_argument('--verbose', action='store_true', help="be verbose")
     parser.add_argument('--cache-size', metavar="N", help="set max cache size")
     return parser
 
@@ -87,61 +105,163 @@ def _parse_cache_size(size_str=None):
     return int(float(literal) * factor)
 
 
+class Serialist(object):
+
+    disable_create_dirs = False
+
+    def serialize(self, thing, writable):
+        raise NotImplementedError()
+
+    def deserialize(self, readable):
+        raise NotImplementedError()
+
+    def serialize_to_disk(self, thing, pathname):
+        dirname = os.path.dirname(pathname)
+        if not self.disable_create_dirs and not os.path.exists(dirname):
+            os.makedirs(dirname, exist_ok=True)
+        with open(pathname, 'wb') as ofile:
+            self.serialize(thing, ofile)
+
+    def deserialize_from_disk(self, pathname):
+        with open(pathname, 'rb') as ifile:
+            return self.deserialize(ifile)
+
+
+class JsonSerialist(Serialist):
+
+    def serialize(self, thing, writable):
+        raise NotImplementedError()
+
+    def deserialize(self, readable):
+        raise NotImplementedError()
+
+
+# not thread safe
+class CompositeCache(object):
+
+    def __init__(self, caches):
+        self.caches = caches
+
+    def get(self, key, load):
+        for cache in self.caches:
+            try:
+                return cache[key]
+            except KeyError:
+                pass
+        value = load(key)
+        self.put(key, value)
+        return value
+
+
+    def put(self, key, value):
+        for cache in self.caches:
+            cache[key] = value
+
+    @classmethod
+    def build(cls, mem_cache_size, key_to_pathname):
+        caches = []
+        if mem_cache_size:
+            caches.append(cachetools.LRUCache(mem_cache_size))
+        if key_to_pathname:
+            caches.append(DiskCache(JsonSerialist(), key_to_pathname))
+        return CompositeCache(caches)
+
+
+_POSIX_NOT_FOUND = 2
+
+
+class DiskCache(object):
+
+    def __init__(self, serialist, key_to_pathname=lambda x: x):
+        assert callable(key_to_pathname), "`key_to_pathname` argument must be callable"
+        self.key_to_pathname = key_to_pathname
+        self.serialist = serialist
+
+    def __getitem__(self, key):
+        pathname = self.key_to_pathname(key)
+        try:
+            return self.serialist.deserialize_from_disk(pathname)
+        except IOError as e:
+            if e.errno == _POSIX_NOT_FOUND:
+                raise KeyError()
+            raise
+
+    def __setitem__(self, key, value):
+        pathname = self.key_to_pathname(key)
+        self.serialist.serialize_to_disk(value, pathname)
+
+    def __iter__(self):
+        raise TypeError("DiskCache is not an iterable mapping type")
+
+    def __contains__(self, key):
+        return os.path.isfile(key)
+
+
+def create_key_to_pathname_function(suffix='', parent_dir=None, strip_prefix=None):
+    if not parent_dir:
+        parent_dir = os.getcwd()
+    def key_to_pathname(key):
+        relative_path = key
+        if strip_prefix and len(key) > len(strip_prefix) and key.startswith(strip_prefix):
+            relative_path = key[len(strip_prefix):]
+        relative_path += suffix
+        return os.path.join(parent_dir, relative_path)
+    return key_to_pathname
 
 
 class Extractor(object):
 
-    def __init__(self, dlibFacePredictorPath, networkModelPath, imgDim, max_cache_size=None):
-        self.align = openface.AlignDlib(dlibFacePredictorPath)
-        self.net = openface.TorchNeuralNet(networkModelPath, imgDim)
-        self.cache = None
+    def __init__(self, dlibFacePredictorPath, networkModelPath, imgDim, cache):
+        self.align = openface.AlignDlib(dlibFacePredictorPath or _find_model('dlib', _MODEL_FILENAME_DLIB))
+        self.net = openface.TorchNeuralNet(networkModelPath or _find_model('openface', _MODEL_FILENAME_OPENFACE), imgDim)
+        self.cache = cache
         self.imgDim = imgDim
-        if max_cache_size is not None:
-            self.cache = cachetools.LRUCache(max_cache_size)
 
-    def _maybe_cache(self, key, value):
-        if self.cache is not None:
-            self.cache[key] = value
+    def extract(self, imgPath_):
+        def load(imgPath):
+            _log.debug("extract %s", imgPath)
+            bgrImg = cv2.imread(imgPath)
+            if bgrImg is None:
+                _log.info("Unable to load image: %s", imgPath)
+                return None
+            rgbImg = cv2.cvtColor(bgrImg, cv2.COLOR_BGR2RGB)
+            _log.debug("Original size: %s", rgbImg.shape)
+            bb = self.align.getLargestFaceBoundingBox(rgbImg)
+            if bb is None:
+                _log.debug("Unable to find a face: %s", imgPath)
+                return None
+            alignedFace = self.align.align(self.imgDim, rgbImg, bb, landmarkIndices=openface.AlignDlib.OUTER_EYES_AND_NOSE)
+            if alignedFace is None:
+                _log.debug("Unable to align image: %s", imgPath)
+                return None
+            rep = self.net.forward(alignedFace)
+            _log.debug("extracted template of size %s", sys.getsizeof(rep))
+            return rep
+        return self.cache.get(imgPath_, load)
 
-    def extract(self, imgPath):
-        _log.debug("lookup %s", imgPath)
-        if self.cache is not None:
-            try:
-                return self.cache[imgPath]
-            except KeyError:
-                pass
-        _log.debug("extract %s", imgPath)
-        bgrImg = cv2.imread(imgPath)
-        if bgrImg is None:
-            _log.info("Unable to load image: {}".format(imgPath))
-            return None
-        rgbImg = cv2.cvtColor(bgrImg, cv2.COLOR_BGR2RGB)
-        _log.debug("Original size: %s", rgbImg.shape)
-        bb = self.align.getLargestFaceBoundingBox(rgbImg)
-        if bb is None:
-            _log.debug("Unable to find a face: %s", imgPath)
-            self._maybe_cache(imgPath, None)
-            return None
-        alignedFace = self.align.align(self.imgDim, rgbImg, bb, landmarkIndices=openface.AlignDlib.OUTER_EYES_AND_NOSE)
-        if alignedFace is None:
-            _log.debug("Unable to align image: %s", imgPath)
-            self._maybe_cache(imgPath, None)
-            return None
-        rep = self.net.forward(alignedFace)
-        _log.debug("extracted template of size %s", sys.getsizeof(rep))
-        self._maybe_cache(imgPath, None)
-        return rep
+
+def _collect_pathnames(specifiers):
+    pathnames = []
+    for specifier in specifiers:
+        if specifier and specifier[0] == '@' and os.path.isfile(specifier):
+            with open(specifier[1:], 'r') as ifile:
+                pathnames += [p for p in ifile.read().split(os.linesep) if p.strip() and not p[0] == '#']
+            continue
+        pathnames.append(specifier)
+    return pathnames
 
 
 def main():
     np.set_printoptions(precision=2)
-    fileDir = os.path.dirname(os.path.realpath(__file__))
-    parser = _create_arg_parser(fileDir)
+    parser = _create_arg_parser()
     args = parser.parse_args()
-    extractor = Extractor(args.dlibFacePredictor, args.networkModel, args.imgDim, _parse_cache_size(args.cache_size))
+    cache = CompositeCache.build(args.cache_size, args.template_storage_dir)
+    if args.mode == _MODE_EXTRACT:
+        extractor = Extractor(args.dlibFacePredictor, args.networkModel, args.imgDim, cache)
     ofile = sys.stdout
     csvout = csv.writer(ofile)
-    for (img1, img2) in itertools.combinations(args.imgs, 2):
+    image_pathnames = _collect_pathnames(args.imgs)
+    for (img1, img2) in itertools.combinations(image_pathnames, 2):
         probe = extractor.extract(img1)
         gallery = None if probe is None else extractor.extract(img2)
         score = ''
