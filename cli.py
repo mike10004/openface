@@ -23,9 +23,9 @@
 #
 
 import argparse
+import json
 import cv2
 import sys
-import itertools
 import os
 import re
 import numpy as np
@@ -74,35 +74,8 @@ def _create_arg_parser():
     parser.add_argument('--networkModel', type=str, metavar='FILE', help="Path to Torch network model.")
     parser.add_argument('--imgDim', type=int, metavar='N', help="Default image dimension.", default=96)
     parser.add_argument('--verbose', action='store_true', help="be verbose")
-    parser.add_argument('--cache-size', metavar="N", help="set max cache size")
+    parser.add_argument('--cache-size', type=int, metavar="N", default=20000, help="set max number of items in cache")
     return parser
-
-
-_FACTORS = {
-    'b': 1024 ** 0,
-    'k': 1024 ** 1,
-    'm': 1024 ** 2,
-    'g': 1024 ** 3,
-    't': 1024 ** 4
-
-}
-
-
-def _parse_cache_size(size_str=None):
-    if size_str is None:
-        return None
-    size_str = size_str.lower()
-    m = re.match(r'^(-)?(\d+(?:\.\d+)?)([bkmgt]|kb|mb|gb|tb)?$', size_str)
-    if not m:
-        raise ValueError("invalid size string")
-    neg = m.group(1)
-    if neg:
-        return None
-    literal, factor_str = m.group(2), m.group(3)
-    factor = 1
-    if factor_str:
-        factor = _FACTORS[factor_str[0]]
-    return int(float(literal) * factor)
 
 
 class Serialist(object):
@@ -127,148 +100,160 @@ class Serialist(object):
             return self.deserialize(ifile)
 
 
+class NumpyAwareJSONEncoder(json.JSONEncoder):
+
+    def default(self, obj):  # pylint: disable=E0202
+        if isinstance(obj, np.ndarray):
+            if obj.ndim == 1:
+                return obj.tolist()
+            else:
+                return [self.default(obj[i]) for i in range(obj.shape[0])]
+        return json.JSONEncoder.default(self, obj)
+
+
 class JsonSerialist(Serialist):
 
-    def serialize(self, thing, writable):
-        raise NotImplementedError()
+    def serialize(self, data, ofile, **kwargs):
+        return json.dump(data, ofile, cls=NumpyAwareJSONEncoder, **kwargs)
 
-    def deserialize(self, readable):
-        raise NotImplementedError()
+    def deserialize(self, ifile):
+        return np.array(json.load(ifile))
 
 
 # not thread safe
-class CompositeCache(object):
+class LoadingCache(object):
 
-    def __init__(self, caches):
-        self.caches = caches
+    def __init__(self, cache_size, load):
+        self.lru_cache = cachetools.LRUCache(cache_size)
+        self.load = load
 
-    def get(self, key, load):
-        for cache in self.caches:
-            try:
-                return cache[key]
-            except KeyError:
-                pass
-        value = load(key)
+    def get(self, key):
+        try:
+            return self.lru_cache[key]
+        except KeyError:
+            pass
+        value = self.load(key)
         self.put(key, value)
         return value
 
 
     def put(self, key, value):
-        for cache in self.caches:
-            cache[key] = value
-
-    @classmethod
-    def build(cls, mem_cache_size, key_to_pathname):
-        caches = []
-        if mem_cache_size:
-            caches.append(cachetools.LRUCache(mem_cache_size))
-        if key_to_pathname:
-            caches.append(DiskCache(JsonSerialist(), key_to_pathname))
-        return CompositeCache(caches)
+        self.lru_cache[key] = value
 
 
 _POSIX_NOT_FOUND = 2
+_IDENTITY = lambda x: x
 
+class DiskLoader(object):
 
-class DiskCache(object):
-
-    def __init__(self, serialist, key_to_pathname=lambda x: x):
+    def __init__(self, serialist, key_to_pathname=_IDENTITY):
         assert callable(key_to_pathname), "`key_to_pathname` argument must be callable"
         self.key_to_pathname = key_to_pathname
         self.serialist = serialist
 
-    def __getitem__(self, key):
+    def __call__(self, *args, **kwargs):
+        if not args and 'key' not in kwargs:
+            raise ValueError("exactly one argument (key) is required")
+        if len(args) > 0:
+            key = args[0]
+        else:
+            key = kwargs['key']
         pathname = self.key_to_pathname(key)
-        try:
-            return self.serialist.deserialize_from_disk(pathname)
-        except IOError as e:
-            if e.errno == _POSIX_NOT_FOUND:
-                raise KeyError()
-            raise
-
-    def __setitem__(self, key, value):
-        pathname = self.key_to_pathname(key)
-        self.serialist.serialize_to_disk(value, pathname)
-
-    def __iter__(self):
-        raise TypeError("DiskCache is not an iterable mapping type")
+        return self.serialist.deserialize_from_disk(pathname)
 
     def __contains__(self, key):
         return os.path.isfile(key)
 
 
-def create_key_to_pathname_function(suffix='', parent_dir=None, strip_prefix=None):
-    if not parent_dir:
-        parent_dir = os.getcwd()
-    def key_to_pathname(key):
-        relative_path = key
-        if strip_prefix and len(key) > len(strip_prefix) and key.startswith(strip_prefix):
-            relative_path = key[len(strip_prefix):]
-        relative_path += suffix
-        return os.path.join(parent_dir, relative_path)
-    return key_to_pathname
-
-
 class Extractor(object):
 
-    def __init__(self, dlibFacePredictorPath, networkModelPath, imgDim, cache):
+    def __init__(self, dlibFacePredictorPath, networkModelPath, imgDim):
         self.align = openface.AlignDlib(dlibFacePredictorPath or _find_model('dlib', _MODEL_FILENAME_DLIB))
         self.net = openface.TorchNeuralNet(networkModelPath or _find_model('openface', _MODEL_FILENAME_OPENFACE), imgDim)
-        self.cache = cache
         self.imgDim = imgDim
 
-    def extract(self, imgPath_):
-        def load(imgPath):
-            _log.debug("extract %s", imgPath)
-            bgrImg = cv2.imread(imgPath)
-            if bgrImg is None:
-                _log.info("Unable to load image: %s", imgPath)
-                return None
-            rgbImg = cv2.cvtColor(bgrImg, cv2.COLOR_BGR2RGB)
-            _log.debug("Original size: %s", rgbImg.shape)
-            bb = self.align.getLargestFaceBoundingBox(rgbImg)
-            if bb is None:
-                _log.debug("Unable to find a face: %s", imgPath)
-                return None
-            alignedFace = self.align.align(self.imgDim, rgbImg, bb, landmarkIndices=openface.AlignDlib.OUTER_EYES_AND_NOSE)
-            if alignedFace is None:
-                _log.debug("Unable to align image: %s", imgPath)
-                return None
-            rep = self.net.forward(alignedFace)
-            _log.debug("extracted template of size %s", sys.getsizeof(rep))
-            return rep
-        return self.cache.get(imgPath_, load)
+    def extract(self, imgPath):
+        _log.debug("extract %s", imgPath)
+        bgrImg = cv2.imread(imgPath)
+        if bgrImg is None:
+            _log.info("Unable to load image: %s", imgPath)
+            return None
+        rgbImg = cv2.cvtColor(bgrImg, cv2.COLOR_BGR2RGB)
+        _log.debug("Original size: %s", rgbImg.shape)
+        bb = self.align.getLargestFaceBoundingBox(rgbImg)
+        if bb is None:
+            _log.debug("Unable to find a face: %s", imgPath)
+            return None
+        alignedFace = self.align.align(self.imgDim, rgbImg, bb, landmarkIndices=openface.AlignDlib.OUTER_EYES_AND_NOSE)
+        if alignedFace is None:
+            _log.debug("Unable to align image: %s", imgPath)
+            return None
+        rep = self.net.forward(alignedFace)
+        _log.debug("extracted template of size %s", sys.getsizeof(rep))
+        return rep
 
 
-def _collect_pathnames(specifiers):
-    pathnames = []
-    for specifier in specifiers:
-        if specifier and specifier[0] == '@' and os.path.isfile(specifier):
-            with open(specifier[1:], 'r') as ifile:
-                pathnames += [p for p in ifile.read().split(os.linesep) if p.strip() and not p[0] == '#']
-            continue
-        pathnames.append(specifier)
-    return pathnames
+def _collect_pathnames(mode, positionals, index_file):
+    if mode == _MODE_EXTRACT:
+        for p in positionals:
+            yield os.path.normpath(p)
+        if index_file:
+            with open(index_file, 'r') as ifile:
+                for line in ifile:
+                    yield os.path.normpath(line.rstrip())
+    elif mode == _MODE_MATCH:
+        for i in range(0, len(positionals), 2):
+            yield os.path.normpath(positionals[i]), os.path.normpath(positionals[i+1])
+        if index_file:
+            with open(index_file, 'r') as ifile:
+                for line in ifile:
+                    a, b = re.split(r'\s+', line.rstrip(), 1)
+                    yield os.path.normpath(a), os.path.normpath(b)
+    else:
+        raise ValueError("illegal mode")
+
+
+class Matcher(object):
+
+    def __init__(self, cache):
+        self.cache = cache
+
+    def compare_files(self, probe, gallery):
+        p_rep = self.cache.get(probe)
+        g_rep = self.cache.get(gallery)
+        d = p_rep - g_rep
+        score = np.dot(d, d)
+        return score
 
 
 def main():
     np.set_printoptions(precision=2)
     parser = _create_arg_parser()
     args = parser.parse_args()
-    cache = CompositeCache.build(args.cache_size, args.template_storage_dir)
-    if args.mode == _MODE_EXTRACT:
-        extractor = Extractor(args.dlibFacePredictor, args.networkModel, args.imgDim, cache)
+    serialist = JsonSerialist()
     ofile = sys.stdout
     csvout = csv.writer(ofile)
-    image_pathnames = _collect_pathnames(args.imgs)
-    for (img1, img2) in itertools.combinations(image_pathnames, 2):
-        probe = extractor.extract(img1)
-        gallery = None if probe is None else extractor.extract(img2)
-        score = ''
-        if probe is not None and gallery is not None:
-            d = probe - gallery
-            score = np.dot(d, d)
-        csvout.writerow([score, img1, img2])
+    input_generator = _collect_pathnames(args.mode, args.files, args.files_from)
+    if args.mode == _MODE_EXTRACT:
+        extractor = Extractor(args.dlibFacePredictor, args.networkModel, args.imgDim)
+        for image_file in input_generator:
+            rep = extractor.extract(image_file)
+            if rep:
+                output_pathname = os.path.join(args.output_dir, os.path.basename(image_file) + '.ofr')
+                os.makedirs(os.path.dirname(output_pathname), exist_ok=True)
+                serialist.serialize_to_disk(rep, output_pathname)
+                extract_ok = 1
+            else:
+                extract_ok = 0
+            csvout.writerow([extract_ok, os.path.basename(image_file)])
+    elif args.mode == _MODE_MATCH:
+        loader = DiskLoader(serialist)
+        cache = LoadingCache(args.cache_size, loader)
+        matcher = Matcher(cache)
+        for p_file, g_file in input_generator:
+            score = matcher.compare_files(p_file, g_file)
+            csvout.writerow([score, p_file, g_file])
+    return 0
 
 
 if __name__ == '__main__':
