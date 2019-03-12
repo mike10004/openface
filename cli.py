@@ -239,7 +239,7 @@ def main():
         extractor = Extractor(args.dlibFacePredictor, args.networkModel, args.imgDim)
         for image_file in input_generator:
             rep = extractor.extract(image_file)
-            if rep:
+            if rep is not None:
                 output_pathname = os.path.join(args.output_dir, os.path.basename(image_file) + '.ofr')
                 output_dir = args.output_dir if args.output_dir else os.getcwd()
                 os.makedirs(output_dir, exist_ok=True)
